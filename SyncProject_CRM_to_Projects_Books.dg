@@ -1,0 +1,221 @@
+void automation.SyncProject_CRM_to_Projects_Books(String crmProjectId)
+{
+try 
+{
+	// ----------------------------------------------------------------------
+	// STEP 1: DEFENSIVE CHECK & FETCH CRM PROJECT DETAILS
+	// ----------------------------------------------------------------------
+	if(crmProjectId == null || crmProjectId == "")
+	{
+		info "ERROR: crmProjectId is null or empty. Aborting sync.";
+		return;
+	}
+	info "--- Starting Sync for CRM Project ID: " + crmProjectId + " ---";
+	crmProject = zoho.crm.getRecordById("Project",crmProjectId.toLong());
+	if(crmProject.get("id") == null)
+	{
+		info "ERROR: Could not fetch CRM Project. Please check if the record exists.";
+		return;
+	}
+	// Extract standard mapping fields
+	projectName = ifnull(crmProject.get("Name"),"Unnamed Project");
+	// Ensure rate is passed strictly as a String
+	projectRate = ifnull(crmProject.get("Total_Planned_Budget"),"1.0").toString();
+	clientAccountId = "";
+	if(crmProject.get("Client_Account") != null)
+	{
+		clientAccountId = crmProject.get("Client_Account").get("id");
+	}
+	// ----------------------------------------------------------------------
+	// EXPLICIT FIELD MAPPING: CRM -> ZOHO BOOKS (STRICT API VALUES)
+	// ----------------------------------------------------------------------
+	// 1. Billing Method Mapping
+	rawBilling = ifnull(crmProject.get("Billing_Method"),"").toString().trim().toLowerCase();
+	billingMethod = "fixed_cost_for_project";
+	// Safe fallback requirement
+	if(rawBilling.contains("project hours") || rawBilling == "based_on_project_hours")
+	{
+		billingMethod = "based_on_project_hours";
+	}
+	else if(rawBilling.contains("task hours") || rawBilling == "based_on_task_hours")
+	{
+		billingMethod = "based_on_task_hours";
+	}
+	else if(rawBilling.contains("staff hours") || rawBilling == "based_on_staff_hours")
+	{
+		billingMethod = "based_on_staff_hours";
+	}
+	else if(rawBilling.contains("fixed") || rawBilling == "fixed_cost_for_project")
+	{
+		billingMethod = "fixed_cost_for_project";
+	}
+	// 2. Budget Type Mapping
+	rawBudget = ifnull(crmProject.get("Budget_Type"),"").toString().trim().toLowerCase();
+	budgetType = "";
+	// Leave blank if "None" or unmapped
+	if(rawBudget.contains("project cost") || rawBudget == "total_project_cost")
+	{
+		budgetType = "total_project_cost";
+	}
+	else if(rawBudget.contains("project hours") || rawBudget == "total_project_hours")
+	{
+		budgetType = "total_project_hours";
+	}
+	else if(rawBudget.contains("per task") || rawBudget == "hours_per_task")
+	{
+		budgetType = "hours_per_task";
+	}
+	else if(rawBudget.contains("per staff") || rawBudget == "hours_per_staff")
+	{
+		budgetType = "hours_per_staff";
+	}
+	// ----------------------------------------------------------------------
+	// STEP 2: FETCH ZOHO PROJECTS PORTAL ID & CREATE PROJECT
+	// ----------------------------------------------------------------------
+	zProjectsId = "";
+	portalResponse = invokeurl
+	[
+		url :"https://projectsapi.zoho.com.au/restapi/portals/"
+		type :GET
+		connection:"zohoprojectssync"
+	];
+	if(portalResponse.get("portals") != null && portalResponse.get("portals").size() > 0)
+	{
+		portalId = portalResponse.get("portals").get(0).get("id_string");
+		projectsPayload = Map();
+		projectsPayload.put("name",projectName);
+		customFieldsMap = Map();
+		customFieldsMap.put("crm_project_id",crmProjectId);
+		projectsPayload.put("custom_fields",customFieldsMap);
+		createProjectReq = invokeurl
+		[
+			url :"https://projectsapi.zoho.com.au/restapi/portal/" + portalId + "/projects/"
+			type :POST
+			parameters:projectsPayload
+			connection:"zohoprojectssync"
+		];
+		if(createProjectReq.get("projects") != null)
+		{
+			zProjectsId = createProjectReq.get("projects").get(0).get("id_string").toString();
+			info "SUCCESS: Zoho Projects record created. ID: " + zProjectsId;
+		}
+		else
+		{
+			info "ERROR: Failed to create Zoho Project. Response: " + createProjectReq;
+		}
+	}
+	else
+	{
+		info "ERROR: Could not fetch Zoho Projects Portal ID. Response: " + portalResponse;
+	}
+	// ----------------------------------------------------------------------
+	// STEP 3: FETCH ZOHO BOOKS ORG ID, FIND CUSTOMER, & CREATE PROJECT
+	// ----------------------------------------------------------------------
+	zBooksId = "";
+	orgResponse = invokeurl
+	[
+		url :"https://books.zoho.com.au/api/v3/organizations"
+		type :GET
+		connection:"zohobooksconnection"
+	];
+	if(orgResponse.get("organizations") != null && orgResponse.get("organizations").size() > 0)
+	{
+		orgId = orgResponse.get("organizations").get(0).get("organization_id");
+		booksCustomerId = "";
+		if(clientAccountId != "")
+		{
+			contactSearch = invokeurl
+			[
+				url :"https://books.zoho.com.au/api/v3/contacts?zcrm_account_id=" + clientAccountId + "&organization_id=" + orgId
+				type :GET
+				connection:"zohobooksconnection"
+			];
+			if(contactSearch.get("contacts") != null && contactSearch.get("contacts").size() > 0)
+			{
+				booksCustomerId = contactSearch.get("contacts").get(0).get("contact_id");
+				info "SUCCESS: Found Books Customer via CRM ID mapping.";
+			}
+			else
+			{
+				crmAccount = zoho.crm.getRecordById("Accounts",clientAccountId.toLong());
+				accountName = crmAccount.get("Account_Name");
+				if(accountName != null)
+				{
+					nameSearch = invokeurl
+					[
+						url :"https://books.zoho.com.au/api/v3/contacts?company_name=" + zoho.encryption.urlEncode(accountName) + "&organization_id=" + orgId
+						type :GET
+						connection:"zohobooksconnection"
+					];
+					if(nameSearch.get("contacts") != null && nameSearch.get("contacts").size() > 0)
+					{
+						booksCustomerId = nameSearch.get("contacts").get(0).get("contact_id");
+						info "SUCCESS: Found Books Customer via Company Name search.";
+					}
+				}
+			}
+		}
+		if(booksCustomerId != "")
+		{
+			booksPayload = Map();
+			booksPayload.put("project_name",projectName);
+			booksPayload.put("customer_id",booksCustomerId);
+			// Add mapped rate and billing type
+			booksPayload.put("rate",projectRate);
+			booksPayload.put("billing_type",billingMethod);
+			// Only inject Budget Type if a valid mapping was found
+			if(budgetType != "")
+			{
+				booksPayload.put("budget_type",budgetType);
+			}
+			booksCFList = List();
+			booksCFMap = Map();
+			booksCFMap.put("api_name","cf_crm_project_id");
+			booksCFMap.put("value",crmProjectId);
+			booksCFList.add(booksCFMap);
+			booksPayload.put("custom_fields",booksCFList);
+			createBooksReq = invokeurl
+			[
+				url :"https://books.zoho.com.au/api/v3/projects?organization_id=" + orgId
+				type :POST
+				parameters:booksPayload.toString()
+				connection:"zohobooksconnection"
+			];
+			if(createBooksReq.get("code") == 0)
+			{
+				zBooksId = createBooksReq.get("project").get("project_id").toString();
+				info "SUCCESS: Zoho Books record created. ID: " + zBooksId;
+			}
+			else
+			{
+				info "ERROR: Failed to create Zoho Books Project. Response: " + createBooksReq;
+			}
+		}
+	}
+	else
+	{
+		info "ERROR: Could not fetch Zoho Books Organization ID. Response: " + orgResponse;
+	}
+	// ----------------------------------------------------------------------
+	// STEP 4: SYNC NEW IDS BACK TO CRM
+	// ----------------------------------------------------------------------
+	if(zProjectsId != "" || zBooksId != "")
+	{
+		updateMap = Map();
+		if(zProjectsId != "")
+		{
+			updateMap.put("Zoho_Projects_ID",zProjectsId);
+		}
+		if(zBooksId != "")
+		{
+			updateMap.put("Zoho_Books_ID",zBooksId);
+		}
+		updateResp = zoho.crm.updateRecord("Project",crmProjectId.toLong(),updateMap);
+		info "CRM Update Response: " + updateResp;
+	}
+}
+catch (e)
+{
+	info "FATAL ERROR in automation.SyncProject_CRM_to_Projects_Books: " + e;
+}
+}
