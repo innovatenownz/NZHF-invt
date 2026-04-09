@@ -1,0 +1,117 @@
+void automation.SyncBudgetSubcategory_CRM_to_BooksSubCOA(Int subcategoryId)
+{
+info "--- Starting Budget Subcategory Sync (AU Data Center) ---";
+// -----------------------------------------------------------
+// 1. DEFENSIVE CHECK: Validate Input Parameter
+// -----------------------------------------------------------
+if(subcategoryId == null)
+{
+	info "ERROR: subcategoryId parameter is null. Aborting.";
+	return;
+}
+// -----------------------------------------------------------
+// 2. FETCH CRM DATA: Get the Budget Subcategory Record
+// -----------------------------------------------------------
+subcatRecord = zoho.crm.getRecordById("Budget_Subcategory",subcategoryId.toLong());
+if(subcatRecord.get("id") == null)
+{
+	info "ERROR: Could not find Budget Subcategory with ID: " + subcategoryId;
+	return;
+}
+subcatName = ifnull(subcatRecord.get("Name"),"");
+parentCategoryMap = subcatRecord.get("Budget_Category");
+if(subcatName == "")
+{
+	info "ERROR: Budget Subcategory Name is empty. Cannot create COA without a name.";
+	return;
+}
+if(parentCategoryMap == null || parentCategoryMap.get("id") == null)
+{
+	info "ERROR: No Parent Budget Category linked to this subcategory. Sync aborted.";
+	return;
+}
+parentCategoryId = parentCategoryMap.get("id");
+// -----------------------------------------------------------
+// 3. FETCH PARENT CRM DATA: Retrieve Parent COA ID
+// -----------------------------------------------------------
+parentRecord = zoho.crm.getRecordById("Budget_Category",parentCategoryId.toLong());
+if(parentRecord.get("id") == null)
+{
+	info "ERROR: Could not find Parent Budget Category with ID: " + parentCategoryId;
+	return;
+}
+parentBooksAccountId = ifnull(parentRecord.get("Books_Account_ID"),"");
+if(parentBooksAccountId == "")
+{
+	info "ERROR: The Parent Budget Category does not have a Zoho Books COA ID (Books_Account_ID) synced yet. Please sync the parent first.";
+	return;
+}
+// -----------------------------------------------------------
+// 4. FETCH ZOHO BOOKS ORG ID DYNAMICALLY (AU Endpoint)
+// -----------------------------------------------------------
+orgResponse = invokeurl
+[
+	url :"https://www.zohoapis.com.au/books/v3/organizations"
+	type :GET
+	connection:"zohobooksconnection"
+];
+orgId = "";
+if(orgResponse.get("code") == 0 && orgResponse.get("organizations") != null)
+{
+	orgList = orgResponse.get("organizations");
+	if(orgList.size() > 0)
+	{
+		orgId = orgList.get(0).get("organization_id");
+		info "Successfully fetched Organization ID: " + orgId;
+	}
+}
+if(orgId == "")
+{
+	info "ERROR: Failed to fetch Zoho Books Organization ID. Response: " + orgResponse;
+	return;
+}
+// -----------------------------------------------------------
+// 5. CREATE SUB-ACCOUNT IN ZOHO BOOKS (AU Endpoint)
+// -----------------------------------------------------------
+// Prepare the payload for Books API
+booksPayload = Map();
+booksPayload.put("account_name",subcatName);
+booksPayload.put("parent_account_id",parentBooksAccountId);
+// Note: Setting account type to 'expense' by default. Update if needed based on your accounting structure.
+booksPayload.put("account_type","expense");
+createCoaUrl = "https://www.zohoapis.com.au/books/v3/chartofaccounts?organization_id=" + orgId;
+info "Creating COA in Books payload: " + booksPayload;
+createCoaResponse = invokeurl
+[
+	url :createCoaUrl
+	type :POST
+	parameters:booksPayload.toString()
+	connection:"zohobooksconnection"
+];
+// -----------------------------------------------------------
+// 6. HANDLE BOOKS RESPONSE AND UPDATE CRM
+// -----------------------------------------------------------
+if(createCoaResponse.get("code") == 0 && createCoaResponse.get("chart_of_account") != null)
+{
+	newBooksSubAccountId = createCoaResponse.get("chart_of_account").get("account_id");
+	info "SUCCESS: Created Zoho Books Sub-Account. ID: " + newBooksSubAccountId;
+	// Prepare map to update CRM record
+	crmUpdateMap = Map();
+	crmUpdateMap.put("Books_Sub_Account_ID",newBooksSubAccountId);
+	//crmUpdateMap.put("Budget_Category_Books_COA_ID", parentBooksAccountId);
+	updateResp = zoho.crm.updateRecord("Budget_Subcategory",subcategoryId.toLong(),crmUpdateMap);
+	if(updateResp.get("id") != null)
+	{
+		info "SUCCESS: CRM Budget Subcategory updated with Books Sub-Account ID.";
+	}
+	else
+	{
+		info "ERROR: Failed to update CRM record. Response: " + updateResp;
+	}
+}
+else
+{
+	info "ERROR: Failed to create Chart of Account in Zoho Books. Response: " + createCoaResponse;
+}
+info "--- End Budget Subcategory Sync ---";
+}

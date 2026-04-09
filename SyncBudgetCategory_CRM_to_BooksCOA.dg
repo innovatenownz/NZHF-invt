@@ -1,0 +1,76 @@
+void automation.SyncBudgetCategory_CRM_to_BooksCOA(Int category_id)
+{
+// ==========================================
+// 1. DEFENSIVE CHECKS & FETCH CRM RECORD
+// ==========================================
+if(category_id == null || category_id == 0)
+{
+	info "Validation Error: category_id is missing.";
+	return;
+}
+crmRecord = zoho.crm.getRecordById("Budget_Category",category_id);
+if(crmRecord.get("id") == null)
+{
+	info "Validation Error: CRM Record not found.";
+	return;
+}
+// ==========================================
+// 2. FETCH ORG ID (USING .COM.AU DOMAIN)
+// ==========================================
+// Updated to zohoapis.com.au for the Australian Data Center
+orgResponse = invokeurl
+[
+	url :"https://www.zohoapis.com.au/books/v3/organizations"
+	type :GET
+	connection:"zohobooksconnection"
+];
+// Safely extract the organization ID if the call is successful
+orgId = if(orgResponse.get("code") == 0 && orgResponse.get("organizations").size() > 0,orgResponse.get("organizations").get(0).get("organization_id"),"");
+if(orgId == "")
+{
+	info "API Error: Could not retrieve Zoho Books Organization ID. Response: " + orgResponse;
+	return;
+}
+// ==========================================
+// 3. CONSTRUCT PAYLOAD FOR BOOKS COA
+// ==========================================
+coaPayload = Map();
+coaPayload.put("account_name",crmRecord.get("Name"));
+coaPayload.put("account_type","expense");
+// Defensive checks to only include optional fields if they have data
+if(crmRecord.get("Category_Code") != null && crmRecord.get("Category_Code") != "")
+{
+	coaPayload.put("account_code",crmRecord.get("Category_Code"));
+}
+if(crmRecord.get("Description") != null && crmRecord.get("Description") != "")
+{
+	coaPayload.put("description",crmRecord.get("Description"));
+}
+// ==========================================
+// 4. EXECUTE API CALL (USING .COM.AU DOMAIN)
+// ==========================================
+// Updated to zohoapis.com.au for the POST request
+booksResponse = invokeurl
+[
+	url :"https://www.zohoapis.com.au/books/v3/chartofaccounts?organization_id=" + orgId
+	type :POST
+	parameters:coaPayload.toString()
+	connection:"zohobooksconnection"
+];
+// ==========================================
+// 5. ERROR HANDLING & DATA LOOPBACK
+// ==========================================
+if(booksResponse.get("code") == 0)
+{
+	// Extract the new account ID from the successful response
+	accountId = booksResponse.get("chart_of_account").get("account_id");
+	// Update the CRM Budget Category with the new Books Account ID
+	updateResp = zoho.crm.updateRecord("Budget_Category",category_id,{"Books_Account_ID":accountId});
+	info "Success: COA Created. CRM Link Status: " + updateResp.get("status");
+}
+else
+{
+	// Log the exact error message from Zoho Books if creation fails
+	info "Books API Error: " + booksResponse.get("message");
+}
+}
